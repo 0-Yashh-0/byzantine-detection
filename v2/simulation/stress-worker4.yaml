@@ -1,0 +1,24 @@
+# To run this file:
+# kubectl apply -f simulation/stress-worker4.yaml
+# To delete this file:
+# kubectl delete -f simulation/stress-worker4.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: byzantine-attack
+  namespace: default
+spec:
+  # Pin to a specific worker node
+  nodeName: byzantine-cluster-worker4
+  containers:
+    - name: cpu-stress
+      image: polinux/stress
+      command: ["stress"]
+      args: ["--cpu", "4", "--vm", "1", "--vm-bytes", "128M", "--timeout", "60s"]
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "128Mi"
+        limits:
+          cpu: "2000m"
+          memory: "256Mi"

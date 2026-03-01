@@ -1,0 +1,69 @@
+================================================================================
+            SCALING GUIDE: RUNNING MULTIPLE WORKER NODES
+================================================================================
+
+1. WHAT IS SCALING?
+--------------------------------------------------------------------------------
+Currently, you are running a "Single-Node" cluster (1 Control Plane + 1 Worker).
+Scaling means adding more "Worker" nodes to your cluster, effectively creating a
+mini-datacenter inside your laptop.
+
+Target Setup: 1 Control Plane + 5 Workers (Total 6 Nodes).
+
+
+2. WHY DO THIS? (The "Real-World" Scenario)
+--------------------------------------------------------------------------------
+In a real-world production environment, you never run just 1 node.
+For Byzantine Fault Tolerance (BFT), the magic number is usually:
+    
+    Total Nodes = 3f + 1
+
+Where 'f' is the number of faulty (or malicious) nodes you want to tolerate.
+- To survive 1 malicious node, you need 3*1 + 1 = 4 total nodes.
+- If you have 5 nodes, you can safely tolerate 1 faulty node while the other 4
+  maintain consensus and cluster health.
+
+By running 5 nodes locally, you can:
+1. "Cordon" one node (block it) and see workloads move to the other 4.
+2. Simulate a distributed attack where only part of your infrastructure is compromised.
+3. Test if your LSTM model correctly identifies ONLY the specific bad node
+   without flagging the healthy ones.
+
+
+3. HOW TO DO IT
+--------------------------------------------------------------------------------
+I have created a dedicated configuration file for you: `v2/multinode.yaml`
+
+To launch this 5-node cluster, run the following command in your WSL terminal:
+
+    # 1. Delete old cluster first
+    kind delete cluster --name byzantine-cluster
+
+    # 2. Create new cluster with 5 nodes config
+    kind create cluster --name byzantine-cluster --config v2/multinode.yaml
+
+
+4. IMPORTANT: HARDWARE LIMITS (Can your laptop handle it?)
+--------------------------------------------------------------------------------
+Running a Kubernetes node is not free. Each "node" is a Docker container that
+consumes RAM and CPU.
+
+Rough Estimates per Node (Idle):
+- RAM: ~512 MB - 1 GB (minimum) per node
+- CPU: ~10-20% of a core (idle)
+
+SCALING LIMITS FOR YOUR LAPTOP:
+
+[16 GB RAM System]
+- Safe:      3 Worker Nodes + 1 Control Plane (Total 4)
+- Max Push:  5 Worker Nodes + 1 Control Plane (Total 6) -> *Might be slow*
+- Danger:    10+ Nodes -> System will likely freeze/crash.
+
+[32 GB RAM System]
+- Safe:      10 Worker Nodes
+- Max Push:  20 Nodes
+
+RECOMMENDATION:
+Start with the provided `v2/multinode.yaml` (1 MP + 5 Workers). This is the
+perfect balance for a "Real-World" simulation on a standard developer laptop.
+If your system starts lagging, edit the yaml file and remove a few worker lines.

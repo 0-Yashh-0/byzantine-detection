@@ -1,0 +1,10 @@
+apiVersion: security.example.com/v1
+kind: ByzantinePolicy
+metadata:
+  name: strict-protection
+  namespace: default
+spec:
+  intervalSeconds: 5
+  cpuThreshold: 85.0
+  enforcementAction: "cordon"
+  autoRemediate: true

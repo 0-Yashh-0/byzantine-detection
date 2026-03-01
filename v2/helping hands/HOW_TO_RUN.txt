@@ -1,0 +1,299 @@
+================================================================================
+            BYZANTINE DETECTION v2 — COMPLETE RUN GUIDE
+================================================================================
+
+IMPORTANT CONTEXT:
+  - Python (venv), ML scripts → run on your LOCAL Windows machine (PowerShell)
+  - Docker, kubectl, kind    → installed and run inside WSL (Ubuntu/Debian)
+  - The project folder on Windows is accessible in WSL at:
+      /mnt/d/BTP/8th\ Sem/byzantine_detection-main/
+
+================================================================================
+PART 1 — PREREQUISITES: WHAT YOU NEED & HOW TO INSTALL IT
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+1A. ON YOUR LOCAL WINDOWS MACHINE
+────────────────────────────────────────────────────────────────────────────────
+
+[1] Python 3.10 or 3.11
+    Download from: https://www.python.org/downloads/
+    During install: CHECK "Add Python to PATH"
+
+    Verify:
+      python --version
+
+[2] pip (comes with Python, but update it):
+      python -m pip install --upgrade pip
+
+[3] Git (optional, for cloning if needed):
+    Download from: https://git-scm.com/download/win
+
+NOTE: You do NOT need Docker Desktop, kubectl, or kind on Windows.
+      Those all run inside WSL only.
+
+────────────────────────────────────────────────────────────────────────────────
+1B. INSIDE WSL (Ubuntu recommended)
+────────────────────────────────────────────────────────────────────────────────
+
+First, open WSL terminal. To install Ubuntu WSL if not already:
+  (Run in PowerShell as Admin)
+  wsl --install -d Ubuntu
+
+Then open Ubuntu terminal and run the following:
+
+--- Update system ---
+  sudo apt update && sudo apt upgrade -y
+
+--- [1] Install Docker inside WSL ---
+  sudo apt install -y ca-certificates curl gnupg lsb-release
+  sudo mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+    sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+  sudo apt update
+  sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+  # Add your user to docker group so you don't need sudo every time
+  sudo usermod -aG docker $USER
+  newgrp docker
+
+  # Start Docker service (in WSL you often need to start it manually)
+  sudo service docker start
+
+  # Verify Docker works:
+  docker run hello-world
+
+--- [2] Install kubectl inside WSL ---
+  curl -LO "https://dl.k8s.io/release/$(curl -sL \
+    https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+  chmod +x kubectl
+  sudo mv kubectl /usr/local/bin/kubectl
+
+  # Verify:
+  kubectl version --client
+
+--- [3] Install kind inside WSL ---
+  curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
+  chmod +x ./kind
+  sudo mv ./kind /usr/local/bin/kind
+
+  # Verify:
+  kind version
+
+================================================================================
+PART 2 — LOCAL RUN (Python in venv, WSL cluster, metrics via port-forward)
+================================================================================
+
+This setup runs the ML/operator Python code on your Windows machine in a venv,
+while the Kubernetes cluster (Kind) runs inside WSL.
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 1 — Create & Activate Python Virtual Environment (PowerShell)
+────────────────────────────────────────────────────────────────────────────────
+
+  # Navigate to the v2 folder
+  cd "d:\BTP\8th Sem\byzantine_detection-main\v2"
+
+  # Create the virtual environment
+  python -m venv .venv
+
+  # Activate it
+  .\.venv\Scripts\Activate.ps1
+
+  # If you get an execution policy error, run this first (once):
+  Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+  # Install all Python dependencies inside the venv
+  pip install -r requirements.txt
+
+  # Also install matplotlib for validate script
+  pip install matplotlib
+
+  #To exit a Python virtual environment (venv)
+  deactivate
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 2 — Create the Kind Kubernetes Cluster (WSL Terminal)
+────────────────────────────────────────────────────────────────────────────────
+  
+  #Open Command Prompt or PowerShell and run the following command:
+  #This starts the Ubuntu distribution.
+  wsl -d Ubuntu
+
+  # Inside WSL terminal:
+  sudo service docker start
+
+  # Create a Kind cluster with 1 control-plane + 5 worker node
+  kind create cluster --name byzantine-cluster --config v2/kind-multinode.yaml
+
+  # Verify the cluster is up:
+  kubectl get nodes
+  # You should see: kind-control-plane (Ready) and kind-worker (Ready)
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 3 — Get kubeconfig from WSL to Windows 
+────────────────────────────────────────────────────────────────────────────────
+
+  # In WSL — export kubeconfig to a Windows-accessible path:
+  mkdir -p ~/.kube
+  kind get kubeconfig --name byzantine-cluster > ~/.kube/config
+
+  #IF ONLY YOU HAVE kubectl INSTALLED IN WINDOWS
+  # Copy it to your Windows user profile (so PowerShell can also use kubectl):
+  cp ~/.kube/config /mnt/c/Users/<YOUR_WINDOWS_USERNAME>/.kube/config
+
+  # Replace <YOUR_WINDOWS_USERNAME> with your actual Windows username
+  # Now kubectl also works from PowerShell (if you have kubectl for Windows installed)
+  # But for this project, all kubectl commands are run in WSL.
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 4 — Deploy the Observability Stack (WSL Terminal)
+────────────────────────────────────────────────────────────────────────────────
+  
+  # Navigate to the project folder in WSL:
+  cd /mnt/d/BTP/8th\ Sem/byzantine_detection-main/
+
+  # Apply all observability YAML files:
+  kubectl apply -f v2/observability/node-exporter.yaml
+  kubectl apply -f v2/observability/node-exporter-service.yaml
+  kubectl apply -f v2/observability/prometheus-config.yaml
+  kubectl apply -f v2/observability/prometheus-deployment.yaml
+
+  # Wait for pods to be running (takes ~1-2 min):
+  kubectl get pods -w
+  # Wait until you see: prometheus-... Running, node-exporter-... Running
+  # When they are running exit (ctrl + c)
+
+  # Verify Prometheus service:
+  kubectl get svc prometheus-service
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 5 — Apply CRD and RBAC (WSL Terminal)
+────────────────────────────────────────────────────────────────────────────────
+
+  kubectl apply -f v2/operator/crd.yaml
+  kubectl apply -f v2/operator/rbac.yaml
+
+  # Verify CRD is registered:
+  kubectl get crd | grep byzantine
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 6 — Apply the ByzantinePolicy (WSL Terminal)
+────────────────────────────────────────────────────────────────────────────────
+
+  kubectl apply -f v2/operator/policy-sample.yaml
+
+  # Verify:
+  kubectl get byzantinepolicies
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 7 — Port-Forward Prometheus to localhost (WSL Terminal)
+────────────────────────────────────────────────────────────────────────────────
+
+  # Keep this terminal open! Port-forward Prometheus so it's accessible:
+  kubectl port-forward svc/prometheus-service 9090:8080
+
+  # Prometheus is now accessible at http://localhost:9090 from both WSL and Windows.
+  # You can verify in browser: http://localhost:9090
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 8 — Collect Baseline Training Data (PowerShell, venv active)
+────────────────────────────────────────────────────────────────────────────────
+
+  # Make sure your venv is active and you're in v2/ folder:
+  cd "d:\BTP\8th Sem\byzantine_detection-main\v2"
+  .\.venv\Scripts\Activate.ps1
+
+  # Run data collection (runs for 5 minutes, collects normal metrics):
+  python ml/collect_data.py
+
+  # This creates/updates: v2/dataset/prometheus_baseline.csv
+  # Output: "Logged 10.x.x.x:9100: CPU=X.X% Mem=XX.X%"
+  # TIP: Let the cluster sit idle during collection so you get clean "normal" data.
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 9 — Train the LSTM Model (PowerShell, venv active)
+────────────────────────────────────────────────────────────────────────────────
+
+  python ml/train_lstm.py
+
+  # Output will show training loss per 10 epochs, then the threshold.
+  # This creates:
+  #   v2/ml/lstm_model.pth     <- trained model weights
+  #   v2/ml/scaler.pkl         <- MinMaxScaler fitted to your data
+  #   v2/ml/threshold.txt      <- anomaly threshold (e.g., 0.0523)
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 10 — Validate the Model (PowerShell, venv active)
+────────────────────────────────────────────────────────────────────────────────
+
+  python ml/validate_lstm.py
+
+  # Expected output:
+  #   [Normal Sequence] Reconstruction Error: 0.0123 -> Correctly classified as Normal.
+  #   [Slow Leak Sequence] Reconstruction Error: 0.1456 -> SUCCESS! Anomaly Detected.
+  # If validation fails, you may need more training data (rerun step 8 for longer).
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 11 — Run the Operator Locally (PowerShell, venv active)
+────────────────────────────────────────────────────────────────────────────────
+  
+  # Make sure port-forward (Step 7) is still running in WSL terminal.
+  # Run the operator using the PowerShell helper script:
+
+  cd "d:\BTP\8th Sem\byzantine_detection-main\v2"
+  .\run_local_v2.ps1
+
+  # OR manually:
+  $env:PROMETHEUS_URL="http://localhost:9090"
+  $env:MODEL_PATH="ml/lstm_model.pth"
+  $env:SCALER_PATH="ml/scaler.pkl"
+  $env:THRESHOLD_PATH="ml/threshold.txt"
+  $env:PYTHONIOENCODING="utf-8"
+
+  .\.venv\Scripts\python -m kopf run operator/main.py --quiet  #For only details
+  .\.venv\Scripts\python -m kopf run operator/main.py --verbose #For verbose (all logs) details
+
+  # Expected output every 10 seconds:
+  #   Node: kind-worker | Loss: 0.0089 | Trust: 100.0
+  # The operator is now running and monitoring!
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 12 — (OPTIONAL) Simulate a Byzantine Attack (WSL Terminal)
+────────────────────────────────────────────────────────────────────────────────
+
+  # Deploy the memory-leak pod to kind-worker:
+  kubectl apply -f v2/simulation/leak-pod.yaml
+
+  # Watch the pod start leaking memory:
+  kubectl logs -f memory-leak-simulation
+
+  # Watch the operator detect it and eventually cordon the node:
+  # (In the operator PowerShell terminal, you'll see trust score dropping)
+  # In WSL: watch node status
+  kubectl get nodes -w
+
+  # Once cordoned, kind-worker will show: SchedulingDisabled
+
+  # To remove the attack and let the node recover:
+  kubectl delete pod memory-leak-simulation
+  # Trust score will slowly climb back; node will be uncordoned automatically.
+
+────────────────────────────────────────────────────────────────────────────────
+STEP 13 — TEARDOWN (when done) (WSL Terminal)
+────────────────────────────────────────────────────────────────────────────────
+
+  # Delete the Kind cluster entirely:
+  kind delete cluster --name byzantine-cluster
+
+  # Stop Docker (optional):
+  sudo systemctl stop docker.socket docker.service
+
+  # In PowerShell: deactivate venv
+  deactivate

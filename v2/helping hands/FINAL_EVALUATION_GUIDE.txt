@@ -1,0 +1,168 @@
+==============================================================================
+  BYZANTINE DETECTION - FINAL EVALUATION GUIDE
+  Run this step-by-step during your live demo
+==============================================================================
+
+PREREQUISITES:
+  - Docker Desktop running
+  - WSL terminal open
+  - PowerShell terminal open
+  - Kind cluster already created (see HOW_TO_RUN.txt if not)
+
+==============================================================================
+  PHASE 1: START THE CLUSTER SERVICES (WSL Terminal)
+==============================================================================
+
+# 1. Check cluster is running
+kubectl get nodes
+
+# Expected: 1 control-plane + 5 workers, all "Ready"
+
+# 2. Check Prometheus and node-exporter are running
+kubectl get pods
+
+# Expected: prometheus-deployment-xxx  Running
+#           node-exporter-xxx (one per node)  Running
+
+# If NOT running, apply them:
+#   kubectl apply -f monitoring/node-exporter-daemonset.yaml
+#   kubectl apply -f monitoring/prometheus-deployment.yaml
+#   kubectl apply -f monitoring/prometheus-service.yaml
+
+# 3. Apply the CRD and ByzantinePolicy (one-time)
+kubectl apply -f operator/crd.yaml
+kubectl apply -f operator/policy-sample.yaml
+
+# 4. Start Prometheus port-forward (KEEP THIS RUNNING)
+kubectl port-forward svc/prometheus-service 9090:9090
+
+# Leave this terminal running, open a new WSL terminal for later steps
+
+
+==============================================================================
+  PHASE 2: START THE OPERATOR (PowerShell Terminal)
+==============================================================================
+
+# 1. Navigate to project
+cd "d:\BTP\8th Sem\byzantine_detection-main\v2"
+
+# Create the virtual environment
+python -m venv .venv
+
+# Activate it
+.\.venv\Scripts\Activate.ps1
+
+# 3. Set environment variables
+$env:PROMETHEUS_URL="http://localhost:9090"
+$env:MODEL_PATH="ml/lstm_model.pth"
+$env:SCALER_PATH="ml/scaler.pkl"
+$env:THRESHOLD_PATH="ml/threshold.txt"
+$env:PYTHONIOENCODING="utf-8"
+
+# 4. Run the operator
+python -m kopf run operator/main.py --quiet  #For only details
+python -m kopf run operator/main.py --verbose #For verbose (all logs) details
+
+# Expected output with --quiet (after ~3.3 minutes for buffer fill):
+#   ✅ Loaded Brain (Threshold: 0.0500)
+#   [byzantine-cluster-worker]  Loss=0.02 | Trust=100.0 | ✅ normal
+#   [byzantine-cluster-worker2] Loss=0.02 | Trust=100.0 | ✅ normal
+#   [byzantine-cluster-worker3] Loss=0.02 | Trust=100.0 | ✅ normal
+#   [byzantine-cluster-worker4] Loss=0.02 | Trust=100.0 | ✅ normal
+#   [byzantine-cluster-worker5] Loss=0.02 | Trust=100.0 | ✅ normal
+
+# Wait until ALL nodes show ✅ normal before proceeding to Phase 3
+
+
+==============================================================================
+  PHASE 3: SIMULATE BYZANTINE ATTACK (New WSL Terminal)
+==============================================================================
+
+# 1. Deploy stress pod on worker4
+kubectl apply -f simulation/stress-worker4.yaml
+
+# 2. Verify the stress pod is running
+kubectl get pods -o wide
+# OR
+docker stats
+
+# Expected: byzantine-attack  Running  (on byzantine-cluster-worker4)
+
+# 3. Watch operator output (PowerShell terminal)
+# Within ~1-2 minutes you should see:
+#   [byzantine-cluster-worker4] Loss=0.08+ | Trust= 95.0 | ⚠️  ANOMALY
+#   ...trust drops by 5 each tick...
+#   🚫 CORDONED  byzantine-cluster-worker4  (trust too low)
+
+# 4. Verify node is cordoned
+kubectl get nodes
+
+# Expected: byzantine-cluster-worker4  Ready,SchedulingDisabled
+
+
+==============================================================================
+  PHASE 4: RECOVERY (New WSL Terminal)
+==============================================================================
+
+# 1. Delete the stress pod (simulates: attack stopped)
+kubectl delete -f simulation/stress-worker4.yaml
+
+# 2. Watch operator output (PowerShell terminal)
+# After ~1.5 min (buffer flush), worker4 returns to normal:
+#   [byzantine-cluster-worker4] Loss=0.02 | Trust= 36.0 | ✅ normal
+#   ...trust increases by 3 each tick...
+#   ✅ UNCORDONED byzantine-cluster-worker4  (trust recovered)
+
+# 3. Verify node is uncordoned
+kubectl get nodes -w
+
+# Expected: byzantine-cluster-worker4  Ready  (no SchedulingDisabled)
+
+
+==============================================================================
+  PHASE 5 (OPTIONAL): ATTACK SECOND NODE
+==============================================================================
+
+# Deploy stress on worker2
+kubectl apply -f simulation/stress-worker2.yaml
+
+# Watch both worker2 and worker4 (if still stressed) get cordoned
+# Other workers remain ✅ normal
+
+# Cleanup
+kubectl delete -f simulation/stress-worker2.yaml
+
+
+==============================================================================
+  CLEANUP: AFTER EVALUATION
+==============================================================================
+
+# 1. Stop operator: Ctrl+C in PowerShell
+
+# 2. Delete stress pods (if any)
+kubectl delete -f simulation/stress-worker4.yaml
+kubectl delete -f simulation/stress-worker2.yaml
+
+# 3. Uncordon all nodes (if any stuck)
+kubectl uncordon byzantine-cluster-worker
+kubectl uncordon byzantine-cluster-worker2
+kubectl uncordon byzantine-cluster-worker3
+kubectl uncordon byzantine-cluster-worker4
+kubectl uncordon byzantine-cluster-worker5
+
+# 4. (Optional) Delete the cluster entirely
+kind delete cluster --name byzantine-cluster
+
+
+==============================================================================
+  QUICK REFERENCE: KEY PARAMETERS
+==============================================================================
+
+  Threshold       : 0.05   (Loss above this = anomaly)
+  Trust decay     : -5     per anomaly tick
+  Trust reward    : +3     per normal tick
+  Cordon at       : Trust < 40
+  Uncordon at     : Trust > 60
+  Reconcile timer : 10 seconds
+  Buffer size     : 20 measurements (SEQ_LEN)
+  Buffer fill time: ~3.3 minutes (20 × 10s)

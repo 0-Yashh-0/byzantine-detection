@@ -1,0 +1,49 @@
+# How to Test the Byzantine Operator
+
+To delete image:
+docker rmi byzantine-detector:v2
+
+## Step 1: Build and Deploy the New Operator
+The operator has been updated to use the newly trained, highly accurate LSTM model. 
+1. Build the new Docker image (run this from your project root `d:\BTP\8th Sem\byzantine_detection-main`):
+```bash
+docker build -t byzantine-detector:v2 -f v2/operator/Dockerfile .
+```
+2. Load the image into your Kind cluster:
+```bash
+kind load docker-image byzantine-detector:v2 --name byzantine-cluster
+```
+3. Restart the operator deployment so it picks up the new image:
+```bash
+kubectl rollout restart deployment/byzantine-detector
+```
+
+## Step 2: Monitor the Operator Logs
+The operator continuously evaluates worker nodes every 10 seconds. You can track its live predictions:
+```bash
+kubectl logs -f deployment/byzantine-detector
+```
+You should see output indicating the Loss, Trust Score, and Status for each node.
+
+## Step 3: View the Saved Evaluation Metrics
+The operator now saves its prediction logs inside its pod for offline evaluation. To check these:
+1. Find the operator pod name:
+```bash
+kubectl get pods -l app=byzantine-detector
+```
+2. Exec into the pod and read the metrics log:
+```bash
+kubectl exec -it <pod-name> -- cat /tmp/operator_metrics.log
+```
+
+## Step 4: Simulate a Byzantine Node (The Real Test)
+To verify it cordons anomalies, we need to make one node behave abnormally (simulate an attack).
+Apply a massive stress load to ONLY ONE specific node (e.g., node `.2`).
+1. Create a pod that runs stress-ng on a single node using a `nodeSelector`.
+2. Watch the operator logs. You will see the Loss for that specific node spike above the threshold (~0.046).
+3. The server will decrease its trust score by 5 points every 10 seconds.
+4. Once the trust score drops below 40.0, the operator will **CORDON** the node.
+```bash
+kubectl get nodes
+```
+You will see `SchedulingDisabled` next to the anomalous node! When the attack stops, its trust will recover (+1 per cycle), and the operator will automatically **UNCORDON** it once trust passes 60.0.

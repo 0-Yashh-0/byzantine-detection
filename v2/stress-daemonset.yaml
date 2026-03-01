@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cpu-burner
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: cpu-burner
+  template:
+    metadata:
+      labels:
+        app: cpu-burner
+    spec:
+      containers:
+        - name: burner
+          # Using stress-ng which supports the --cpu-load flag
+          image: alexeiled/stress-ng
+          args: ["--cpu", "2", "--cpu-load", "50", "--vm", "2", "--vm-bytes", "256M", "--sock", "2", "--timeout", "86400s"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "2000m"     # Max 2 Cores
+              memory: "2560Mi"  # Max 256 MB RAM 

@@ -1,0 +1,460 @@
+================================================================================
+             BYZANTINE NODE DETECTION SYSTEM - v2 PROJECT EXPLANATION
+================================================================================
+
+Written for: BTP (B.Tech Project) - 8th Sem
+Directory: byzantine_detection-main/v2/
+--------------------------------------------------------------------------------
+
+TABLE OF CONTENTS
+-----------------
+1. What is This Project?
+2. High-Level Architecture / How Everything Connects
+3. Directory Structure Breakdown
+4. Step-by-Step: How It All Works
+   A. Data Collection (ml/collect_data.py)
+   B. ML Model Training (ml/train_lstm.py)
+   C. Model Validation (ml/validate_lstm.py)
+   D. Kubernetes Observability Stack (observability/)
+   E. The Kubernetes Operator / Brain (operator/main.py)
+   F. Anomaly Detection Logic (inside main.py)
+   G. Trust Score System (inside main.py)
+   H. Enforcement: Cordon / Uncordon (inside main.py)
+   I. Simulation / Attack (simulation/)
+5. Kubernetes Resources (YAMLs)
+6. Running the System: Local vs In-Cluster
+7. Key Design Decisions & Choices
+8. Data Flow Summary (End-to-End)
+
+================================================================================
+1. WHAT IS THIS PROJECT?
+================================================================================
+
+This is a Kubernetes-based Byzantine Fault Detection system. A "Byzantine node"
+in a distributed system is a node that behaves unexpectedly, incorrectly, or
+maliciously — not just a simple crash, but something more subtle like consuming
+abnormal resources (CPU, memory, network), which could be due to:
+
+  - A memory leak (intentional or buggy)
+  - A compromised/malicious container
+  - A DOS/resource exhaustion attack
+
+v2 detects such misbehaving Kubernetes worker nodes in real-time using a
+trained LSTM Autoencoder (a neural network) + a Trust Score system, and then
+automatically quarantines ("cordons") the bad node so Kubernetes stops
+scheduling new work on it.
+
+================================================================================
+2. HIGH-LEVEL ARCHITECTURE — HOW EVERYTHING CONNECTS
+================================================================================
+
+  [Kubernetes Cluster (Kind)]
+        |
+        |-- Worker Node(s)
+        |       |-- Pods running (including possibly attack pods like leak-pod)
+        |       |-- node_exporter (DaemonSet) --> exposes hardware metrics
+        |
+        |-- Prometheus (Deployment)
+        |       |-- Scrapes node_exporter every 5 seconds
+        |       |-- Stores time-series: CPU%, Memory%, Net-in, Net-out
+        |
+        |-- Byzantine Operator (Deployment) <---- THE BRAIN
+                |-- Every 10 seconds:
+                |     1. Reads policy (ByzantinePolicy CRD)
+                |     2. Queries Prometheus for node metrics (last 10 data points)
+                |     3. Feeds data into LSTM Autoencoder (pre-trained ML model)
+                |     4. Gets a "reconstruction error" (anomaly score)
+                |     5. Updates Trust Score for each node
+                |     6. If trust < 40 --> Cordon the node (quarantine)
+                |     7. If trust > 60 --> Uncordon the node (restore)
+
+================================================================================
+3. DIRECTORY STRUCTURE (v2/)
+================================================================================
+
+v2/
+├── dataset/
+│   └── prometheus_baseline.csv     <- Training data (normal node metrics)
+│
+├── ml/
+│   ├── collect_data.py             <- Script to collect baseline data from Prometheus
+│   ├── train_lstm.py               <- Script to train the LSTM Autoencoder model
+│   ├── validate_lstm.py            <- Script to test the trained model
+│   ├── lstm_model.pth              <- Saved/trained PyTorch model weights
+│   ├── scaler.pkl                  <- Saved MinMaxScaler (for normalizing input)
+│   └── threshold.txt               <- Anomaly threshold value (e.g. 0.0523)
+│
+├── observability/
+│   ├── node-exporter.yaml          <- DaemonSet: runs on every node, exposes metrics
+│   ├── node-exporter-service.yaml  <- Service exposing node-exporter to Prometheus
+│   ├── prometheus-config.yaml      <- Prometheus scrape config (every 5s) + RBAC
+│   └── prometheus-deployment.yaml  <- Prometheus server deployment
+│
+├── operator/
+│   ├── main.py                     <- THE CORE: Kopf Operator logic (LSTM + Trust + Enforcement)
+│   ├── crd.yaml                    <- CustomResourceDefinition: ByzantinePolicy
+│   ├── deployment.yaml             <- Deploy the operator into Kubernetes
+│   ├── rbac.yaml                   <- Permissions (cordon nodes, read policies, etc.)
+│   ├── policy-sample.yaml          <- Sample ByzantinePolicy CR to apply
+│   └── Dockerfile                  <- Bundles main.py + ML artifacts into a container
+│
+├── simulation/
+│   └── leak-pod.yaml               <- Attack pod: slowly leaks 50MB memory every 5s
+│
+├── requirements.txt                <- Python deps: kopf, torch, kubernetes, etc.
+├── run_local_v2.ps1                <- PowerShell script to run the operator locally
+└── operator_debug*.log             <- Debug logs from past runs
+
+================================================================================
+4. STEP-BY-STEP: HOW IT ALL WORKS
+================================================================================
+
+------------------------------------------------------------
+A. DATA COLLECTION — ml/collect_data.py
+------------------------------------------------------------
+
+PURPOSE: Collect "normal" (baseline) behavior data from a live cluster.
+
+HOW:
+  - Connects to Prometheus at http://localhost:9090 (port-forwarded)
+  - Every 5 seconds for 300 seconds (5 minutes), it runs 4 PromQL queries:
+      * cpu    : CPU usage % (from idle CPU counter)
+      * mem    : Memory usage % (using Free + Buffers + Cached vs Total)
+      * net_in : Network bytes received per second
+      * net_out: Network bytes transmitted per second
+  - Aggregates results per instance (node endpoint like "10.x.x.x:9100")
+  - Appends each row as: [timestamp, instance, cpu, mem, net_in, net_out]
+    to v2/dataset/prometheus_baseline.csv
+
+RESULT: A CSV file of ~60 rows of NORMAL node behavior (cluster at rest).
+
+------------------------------------------------------------
+B. ML MODEL TRAINING — ml/train_lstm.py
+------------------------------------------------------------
+
+PURPOSE: Train an LSTM Autoencoder to learn what "normal" node behavior looks like.
+
+MODEL ARCHITECTURE — LSTMAutoencoder:
+  The model is an autoencoder, meaning it is trained to:
+    INPUT sequence --> compress to small latent vector --> reconstruct original sequence
+
+  Specifically:
+    Encoder: nn.LSTM(input=4, hidden=32)
+              Takes a (batch, 10, 4) tensor — 10 time steps, 4 features
+              Outputs a hidden state of size 32
+    Bottleneck: Linear(32 -> 8) — compress to 8-dim latent vector
+    Expand:     Linear(8 -> 32) — decompress back to 32-dim
+    Decoder: nn.LSTM(hidden=32, output=32)
+              Runs for 10 steps using the decompressed hidden state
+    Output:  Linear(32 -> 4) — reconstruct the 4 features
+
+  The idea: if the model is trained only on NORMAL data, it learns to
+  reconstruct normal sequences well. Abnormal sequences (anomalies) will
+  have HIGH reconstruction error, because the model has never seen them.
+
+TRAINING PROCESS:
+  - Load prometheus_baseline.csv, extract [cpu, mem, net_in, net_out]
+  - Normalize using MinMaxScaler (scales all values to 0-1 range)
+  - Create sliding windows of length 10 (each "sequence" = 10 time steps)
+  - Add Gaussian noise (noise level 0.01) to augment data, avoid overfitting
+  - Train for 50 epochs using MSELoss (mean squared error) and Adam optimizer
+  - Save model weights to lstm_model.pth, scaler to scaler.pkl
+
+THRESHOLD CALCULATION (3-Sigma Rule):
+  - After training, run the model on original (no-noise) sequences
+  - Compute MAE (mean absolute error) per sequence
+  - threshold = mean(MAE) + 3 * std(MAE)
+  - This means: an error more than 3 standard deviations above average = anomaly
+  - Save threshold to threshold.txt
+
+------------------------------------------------------------
+C. MODEL VALIDATION — ml/validate_lstm.py
+------------------------------------------------------------
+
+PURPOSE: Quick offline test to verify the model works correctly before deploying.
+
+HOW:
+  - Loads the trained model, scaler, and threshold
+  - Creates 2 synthetic sequences:
+      1. NORMAL: CPU~0%, Memory~18%, no network activity (typical idle node)
+      2. ANOMALY: Memory spikes from 18% to 50% over 10 steps (memory leak)
+  - Both are scaled using the saved scaler
+  - Fed into the model; reconstruction errors are compared against threshold
+  - Prints whether each was correctly classified
+
+EXPECTED OUTPUT:
+  [Normal Sequence] Reconstruction Error: X.XXXX -> Correctly classified as Normal.
+  [Slow Leak Sequence] Reconstruction Error: X.XXXX -> SUCCESS! Anomaly Detected.
+
+------------------------------------------------------------
+D. KUBERNETES OBSERVABILITY STACK — observability/
+------------------------------------------------------------
+
+This is the monitoring infrastructure that the operator relies on.
+
+node-exporter.yaml:
+  - A DaemonSet (runs one Pod on EVERY node automatically)
+  - Uses the image prom/node-exporter
+  - Exposes hardware-level metrics: CPU time, memory, disk, network
+  - Listens on port 9100
+
+node-exporter-service.yaml:
+  - A ClusterIP Service that points to the node-exporter DaemonSet
+  - Allows Prometheus to reach node-exporter pods by a stable DNS name
+
+prometheus-config.yaml:
+  - A ConfigMap with prometheus.yml config
+  - Sets scrape_interval = 5s (collects metrics every 5 seconds)
+  - Defines 2 scrape jobs:
+      * kubernetes-nodes: scrapes Kubernetes node endpoints
+      * node-exporter: scrapes the node-exporter service
+  - Also defines ClusterRole and ClusterRoleBinding so Prometheus can
+    read node/pod/service info from the Kubernetes API (for service discovery)
+
+prometheus-deployment.yaml:
+  - Deploys Prometheus server (prom/prometheus image) into the cluster
+  - Mounts the config ConfigMap
+  - Exposes Prometheus on port 9090 via a Service named "prometheus-service"
+
+------------------------------------------------------------
+E. THE KUBERNETES OPERATOR / BRAIN — operator/main.py
+------------------------------------------------------------
+
+PURPOSE: The continuously-running control loop that monitors every node,
+runs the ML model, updates trust scores, and takes enforcement actions.
+
+FRAMEWORK USED: Kopf (Kubernetes Operator Framework for Python)
+  - Kopf lets you write Kubernetes operators in Python
+  - You define event handlers using decorators like @kopf.on.startup() 
+    and @kopf.timer(...)
+
+ON STARTUP — configure():
+  - Loads Kubernetes config (in-cluster or kubeconfig for local runs)
+  - Loads the LSTM model from MODEL_PATH (the .pth file)
+  - Loads the scaler from SCALER_PATH (the .pkl file)
+  - Reads the threshold from THRESHOLD_PATH
+  - Everything is stored as global variables: MODEL, SCALER, THRESHOLD
+
+MAIN LOOP — reconcile() [runs every 10 seconds]:
+  - Triggered by @kopf.timer on any "ByzantinePolicy" custom resource
+  - Lists all Kubernetes nodes (skips control-plane nodes)
+  - For each worker node, runs the full pipeline (fetch → preprocess → infer → act)
+
+------------------------------------------------------------
+F. ANOMALY DETECTION LOGIC — inside main.py
+------------------------------------------------------------
+
+Function: fetch_prometheus_data(node_name)
+  - Queries Prometheus for the last 60 seconds of data at 5s intervals
+  - Runs 4 PromQL queries (CPU, Memory, Net-in, Net-out) as range queries
+  - Takes the last 10 data points (SEQUENCE_LENGTH = 10) 
+  - Returns a numpy array of shape (10, 4)
+  - Returns None if there isn't enough data yet
+
+Inside reconcile(), for each node:
+  1. FETCH: raw_seq = fetch_prometheus_data(node_name) -> shape (10, 4)
+  2. PREPROCESS:
+       seq_scaled = scaler.transform(raw_seq)    # normalize to 0-1
+       seq_tensor = torch.FloatTensor(seq_scaled).unsqueeze(0)  # -> (1, 10, 4)
+  3. INFERENCE:
+       reconstruction = MODEL(seq_tensor)        # model reconstructs the input
+       loss = mean(|reconstruction - input|)     # MAE reconstruction error
+  4. CLASSIFY:
+       is_anomaly = (loss > THRESHOLD)           # true if unusual/abnormal
+
+------------------------------------------------------------
+G. TRUST SCORE SYSTEM — TrustTracker class in main.py
+------------------------------------------------------------
+
+PURPOSE: Instead of immediately acting on a single anomalous reading,
+the system maintains a running "trust score" for each node. This prevents
+false positives from triggering enforcement.
+
+CLASS: TrustTracker
+  - self.scores: dict of {node_name: float}
+  - Default trust score for any new node: 100.0
+
+METHOD: update(node, is_anomaly)
+  - If ANOMALY:  score = max(0, score - 5.0)   [penalty: -5 per bad reading]
+  - If NORMAL:   score = min(100, score + 1.0)  [reward: +1 per good reading]
+  - Returns updated score
+
+LOGIC: A node needs ~12 consecutive anomalous readings (5*12=60 points lost)
+to go from 100 to below 40 (the enforcement threshold). This ensures that
+a brief spike doesn't immediately quarantine the node. Recovery is slower
+(needs 60+ good readings to go from 40 to 100), which prevents flapping.
+
+------------------------------------------------------------
+H. ENFORCEMENT: CORDON / UNCORDON — inside main.py
+------------------------------------------------------------
+
+cordon_node(node_name, logger):
+  - Called when trust_score < 40
+  - Uses Kubernetes API: v1.patch_node(node_name, {"spec": {"unschedulable": True}})
+  - This "cordons" the node: Kubernetes will not schedule NEW pods on it
+  - Existing pods continue to run; the node is just quarantined from new work
+  - Logs: "Cordoned {node_name}" 
+
+uncordon_node(node_name, logger):
+  - Called when autoRemediate=true AND trust_score > 60
+  - Uses Kubernetes API: v1.patch_node(node_name, {"spec": {"unschedulable": False}})
+  - Restores the node to normal scheduling
+  - This is the self-healing aspect of the system
+
+Enforcement thresholds:
+  - Cordon  if trust < 40  (node is distressed / byzantine)
+  - Uncordon if trust > 60  (node has recovered)
+  - The gap between 40 and 60 is a "hysteresis zone" to prevent rapid toggling
+
+------------------------------------------------------------
+I. SIMULATION / ATTACK — simulation/leak-pod.yaml
+------------------------------------------------------------
+
+PURPOSE: To test whether the detection system actually works in practice.
+
+WHAT IT DOES:
+  - Deploys a pod called "memory-leak-simulation" onto "kind-worker" node
+  - The pod runs a Python script that:
+      * Allocates 50MB of memory every 5 seconds indefinitely
+      * Prints "Allocated X MB" for each allocation
+  - This causes the node's memory usage to climb visibly and rapidly
+  - Prometheus picks this up; the LSTM sees abnormal memory sequences
+  - Trust score for kind-worker drops; eventually node gets cordoned
+
+This is an intentional byzantine fault simulation to validate the system.
+
+================================================================================
+5. KUBERNETES RESOURCES (YAML FILES)
+================================================================================
+
+crd.yaml — CustomResourceDefinition: "ByzantinePolicy"
+  - Defines a new Kubernetes resource type: ByzantinePolicy (short: bp)
+  - Group: security.example.com, Version: v1
+  - Fields in spec:
+      * intervalSeconds (int, default 10): how often to check
+      * cpuThreshold (float, default 90.0): CPU alert threshold
+      * trustDecay (float, default 5.0): penalty per anomaly
+      * enforcementAction (enum: log/taint/cordon/drain): what to do
+      * autoRemediate (bool, default true): whether to uncordon recovered nodes
+  - The operator "watches" these resources and uses them to configure behavior
+
+policy-sample.yaml:
+  - A sample ByzantinePolicy CR to apply with kubectl
+  - Activates the operator's reconcile loop
+
+deployment.yaml:
+  - Deploys the operator container (byzantine-operator:v1) into Kubernetes
+  - Sets PROMETHEUS_URL env var to the in-cluster Prometheus service URL
+  - Resource limits: 300Mi memory, 200m CPU
+
+rbac.yaml:
+  - ServiceAccount: "byzantine-operator"
+  - ClusterRole with permissions to:
+      * get/list/watch/patch: nodes (for cordoning)
+      * get/list/watch/patch: byzantinepolicies (read policy settings)
+      * create: events (for logging)
+      * list/watch/patch/get: clusterkopfpeerings (required by Kopf framework)
+  - ClusterRoleBinding wiring the ServiceAccount to the ClusterRole
+
+Dockerfile:
+  - Base image: python:3.9-slim
+  - Copies requirements.txt, installs deps
+  - Copies main.py + ML artifacts (lstm_model.pth, scaler.pkl, threshold.txt)
+  - Sets ENV vars for model paths
+  - CMD: kopf run /app/main.py --verbose
+
+================================================================================
+6. RUNNING THE SYSTEM: LOCAL VS IN-CLUSTER
+================================================================================
+
+--- LOCAL (for development/testing) ---
+File: run_local_v2.ps1
+
+  1. Port-forward Prometheus: kubectl port-forward svc/prometheus-service 9090:9090
+  2. Set env vars pointing to local ML artifacts
+  3. Run: python -m kopf run operator/main.py --verbose (using local .venv)
+
+  The operator runs on your machine but talks to the test Kubernetes cluster
+  (Kind) via your kubeconfig and queries Prometheus through the port-forward.
+
+--- IN-CLUSTER (production-like) ---
+  1. Build Docker image: docker build -t byzantine-operator:v1 .
+  2. Load into Kind: kind load docker-image byzantine-operator:v1
+  3. Apply CRD: kubectl apply -f operator/crd.yaml
+  4. Apply RBAC: kubectl apply -f operator/rbac.yaml
+  5. Apply Observability: kubectl apply -f observability/
+  6. Apply Operator: kubectl apply -f operator/deployment.yaml
+  7. Apply Policy: kubectl apply -f operator/policy-sample.yaml
+  8. (Optional) Simulate attack: kubectl apply -f simulation/leak-pod.yaml
+
+================================================================================
+7. KEY DESIGN DECISIONS & CHOICES
+================================================================================
+
+1. LSTM Autoencoder (not classifier):
+   - No labelled "attack" data is needed for training
+   - Only normal data is required — the model just learns "what normal looks like"
+   - Any deviation from normal = anomaly (unsupervised anomaly detection)
+
+2. Sequence length of 10:
+   - 10 × 5s = 50 seconds of history per inference
+   - Short enough to detect fast-moving attacks, long enough to catch slow leaks
+
+3. 4 Features: [cpu, mem, net_in, net_out]:
+   - These are the most telling indicators of Byzantine behavior
+   - Cover resource exhaustion (CPU/Mem), data exfiltration (net_out spike),
+     and DDoS reception (net_in spike)
+
+4. 3-Sigma Threshold:
+   - Statistically principled: "anything more than 3 std deviations from
+     normal behavior is unusual" — standard in anomaly detection
+
+5. Trust Score (gradual degradation):
+   - Prevents false positives from transient spikes
+   - Makes the system robust against noisy data
+   - Self-healing via uncordon when node recovers
+
+6. Cordon (not Drain or Delete):
+   - Cordon is the least disruptive action
+   - Existing workloads keep running; new pods are just blocked
+   - Drain (evict pods) or Delete (remove node) would be more aggressive
+
+7. Kopf Framework:
+   - Makes the operator pattern easy in Python
+   - Handles Kubernetes event watching, retries, leader election automatically
+
+================================================================================
+8. DATA FLOW SUMMARY (END-TO-END)
+================================================================================
+
+[ Worker Node Hardware ]
+        |
+        | (OS-level metrics: /proc/stat, /proc/meminfo, /sys/class/net/...)
+        v
+[ node_exporter (port 9100) ]
+        |
+        | (HTTP /metrics endpoint, scraped every 5s)
+        v
+[ Prometheus Server ]
+        |
+        | (Time-series DB stores last N days of metrics)
+        | (Byzantine Operator queries via PromQL HTTP API)
+        v
+[ operator/main.py — reconcile() every 10s ]
+        |
+        |-- fetch_prometheus_data() --> 4 queries --> (10, 4) numpy array
+        |-- scaler.transform()      --> normalize to (10, 4) float array [0-1]
+        |-- LSTMAutoencoder.forward() --> reconstruct the sequence
+        |-- compute MAE (actual vs reconstructed)
+        |-- compare to threshold
+        |
+        |-- TrustTracker.update()   --> update score (+1 or -5)
+        |
+        |-- if score < 40 --> cordon_node()   [Kubernetes API PATCH]
+        |-- if score > 60 --> uncordon_node() [Kubernetes API PATCH]
+        v
+[ Kubernetes Node ]  <-- spec.unschedulable = true/false
+
+================================================================================
+END OF EXPLANATION
+================================================================================

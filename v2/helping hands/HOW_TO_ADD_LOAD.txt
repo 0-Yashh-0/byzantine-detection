@@ -1,0 +1,207 @@
+=========================================================
+  HOW TO ADD LOAD TO KIND WORKER NODES
+  (Simulate real-world traffic for data collection)
+=========================================================
+
+Your cluster runs inside Docker containers (kind = Kubernetes-in-Docker).
+You have 3 main approaches to add load. Start with Approach 1 if you
+want the quickest results.
+
+---------------------------------------------------------
+APPROACH 1: stress-ng via kubectl (Recommended - Easiest)
+---------------------------------------------------------
+Deploy a DaemonSet that runs "stress-ng" on EVERY worker node.
+This gives you controllable CPU + memory load.
+
+STEP 1: Create the file stress-daemonset.yaml in v2/ with this content:
+-----------------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: stress-worker
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: stress-worker
+  template:
+    metadata:
+      labels:
+        app: stress-worker
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: stress
+          image: polinux/stress-ng
+          args:
+            - "--cpu"
+            - "1"          # number of CPU stressor threads
+            - "--cpu-load"
+            - "20"         # target % CPU usage per thread
+            - "--vm"
+            - "1"          # memory stressor
+            - "--vm-bytes"
+            - "64M"       # allocate MB per stressor
+            - "--timeout"
+            - "0"          # run forever (0 = no timeout)
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "150Mi"
+            limits:
+              cpu: "500m"
+              memory: "300Mi"
+-----------------------------------------------------------------
+
+STEP 2: Apply it
+  kubectl apply -f v2/stress-daemonset.yaml
+
+STEP 3: Verify pods are running on all nodes
+  kubectl get pods -o wide
+
+STEP 4: Now run your data collection script and it will see elevated CPU/Mem
+  python ml/collect_data.py
+
+STEP 5: To REMOVE the load when done
+  kubectl delete -f v2/stress-daemonset.yaml
+
+TUNING:
+  - Increase --cpu-load (e.g., 70) for heavier CPU load
+  - Increase --vm-bytes (e.g., 256M) for heavier memory load
+  - Change --cpu 2 to use more stressor threads
+
+
+---------------------------------------------------------
+APPROACH 2: Deploy Nginx + Traffic Generator (Realistic HTTP load)
+---------------------------------------------------------
+This simulates real web server load using nginx + a load generator (wrk).
+
+STEP 1: Deploy nginx as a DaemonSet
+  kubectl apply -f https://k8s.io/examples/application/deployment.yaml
+  
+  OR create nginx-daemonset.yaml:
+-----------------------------------------------------------------
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nginx-worker
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: nginx-worker
+  template:
+    metadata:
+      labels:
+        app: nginx-worker
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "300m"
+              memory: "128Mi"
+-----------------------------------------------------------------
+
+  kubectl apply -f nginx-daemonset.yaml
+
+STEP 2: Expose nginx as a service
+  kubectl expose daemonset nginx-worker --port=80 --type=ClusterIP --name=nginx-svc
+
+STEP 3: Run a load generator pod that sends traffic to nginx
+  kubectl run load-gen --image=williamyeh/wrk --restart=Never -- \
+    wrk -t4 -c100 -d300s http://nginx-svc:80/
+
+  (This sends 4 threads, 100 connections, for 300 seconds)
+
+STEP 4: Now collect data while this runs
+  python ml/collect_data.py
+
+STEP 5: Cleanup
+  kubectl delete daemonset nginx-worker
+  kubectl delete pod load-gen
+  kubectl delete svc nginx-svc
+
+
+---------------------------------------------------------
+APPROACH 3: Direct stress inside Docker containers (No K8s manifest)
+---------------------------------------------------------
+Since kind nodes are Docker containers, you can exec directly into them.
+
+STEP 1: Find your kind node container names
+  docker ps --filter "name=kind"
+  (You'll see names like: kind-worker, kind-worker2, kind-worker3, etc.)
+
+STEP 2: Exec into each worker and run stress
+  docker exec -it kind-worker sh -c "apt-get install -y stress-ng && stress-ng --cpu 1 --cpu-load 40 --vm 1 --vm-bytes 100M --timeout 300 &"
+  docker exec -it kind-worker2 sh -c "apt-get install -y stress-ng && stress-ng --cpu 1 --cpu-load 40 --vm 1 --vm-bytes 100M --timeout 300 &"
+  docker exec -it kind-worker3 sh -c "apt-get install -y stress-ng && stress-ng --cpu 1 --cpu-load 40 --vm 1 --vm-bytes 100M --timeout 300 &"
+
+  NOTE: Replace "kind-worker" with the actual container names from docker ps.
+  The --timeout 300 means it runs for 300 seconds (5 min) then stops.
+
+STEP 3: While stress runs, collect data
+  python ml/collect_data.py
+
+STEP 4: To stop early, exec and kill stress-ng
+  docker exec -it kind-worker pkill stress-ng
+
+
+---------------------------------------------------------
+APPROACH 4: Simulate Network Load
+---------------------------------------------------------
+To see non-zero values in net_in / net_out metrics, you need actual
+network traffic between pods.
+
+STEP 1: Deploy an iperf3 server DaemonSet on workers
+  kubectl run iperf-server --image=networkstatic/iperf3 --restart=Never -- iperf3 -s
+
+STEP 2: Get the pod IP
+  kubectl get pod iperf-server -o wide
+
+STEP 3: Run iperf3 client from another pod
+  kubectl run iperf-client --image=networkstatic/iperf3 --restart=Never -- \
+    iperf3 -c <POD_IP_FROM_STEP_2> -t 300 -b 10M
+
+  (Sends 10 Mbps of traffic for 300 seconds)
+
+STEP 4: Collect data to see net_in/net_out values
+  python ml/collect_data.py
+
+STEP 5: Cleanup
+  kubectl delete pod iperf-server iperf-client
+
+
+---------------------------------------------------------
+RECOMMENDED WORKFLOW FOR YOUR BTP PROJECT
+---------------------------------------------------------
+1. Collect BASELINE data (already done! Your current CSV)
+2. Apply Approach 1 (stress-ng DaemonSet) at different load levels:
+   - Light load:  --cpu-load 20  --vm-bytes 64M
+   - Medium load: --cpu-load 50  --vm-bytes 128M
+   - Heavy load:  --cpu-load 80  --vm-bytes 256M
+3. For each load level, rename/append to a different CSV so you have
+   labeled data for normal vs stressed conditions.
+4. This gives your ML model diverse training data across different
+   operating conditions.
+
+---------------------------------------------------------
+TIPS
+---------------------------------------------------------
+- CPU=0.0% in your current data is because nothing is actually running
+  on the nodes. The stress-ng approach will fix this immediately.
+- Your Prometheus scrape interval is 5s, so you'll see changes fast.
+- The DaemonSet approach (Approach 1) is the cleanest because it
+  respects Kubernetes scheduling and node isolation.
+- You can combine approaches: stress-ng for CPU/mem + iperf for network.
+
+=========================================================

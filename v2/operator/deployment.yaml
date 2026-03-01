@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: byzantine-operator
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: byzantine-operator
+  template:
+    metadata:
+      labels:
+        app: byzantine-operator
+    spec:
+      serviceAccountName: byzantine-operator
+      # ── Force scheduling onto the control-plane node only ──────────────────
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+      # ───────────────────────────────────────────────────────────────────────
+      containers:
+      - name: operator
+        image: byzantine-detector:v2
+        imagePullPolicy: Never
+        env:
+        - name: PROMETHEUS_URL
+          value: "http://prometheus-service.default.svc:9090"
+        resources:
+          limits:
+            memory: "300Mi"
+            cpu: "200m"
+          requests:
+            memory: "100Mi"
+            cpu: "100m"
