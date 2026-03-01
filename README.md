@@ -5,7 +5,6 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.28+-326CE5.svg)](https://kubernetes.io)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C.svg)](https://pytorch.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
 
@@ -141,12 +140,12 @@ v2/
 
 ### Features (4-dimensional input)
 
-| Feature              | PromQL Query                                                       | Scaling     |
-|----------------------|--------------------------------------------------------------------|-------------|
-| CPU Usage (%)        | `100 - avg(irate(node_cpu_seconds_total{mode="idle"}[30s])) * 100` | [0, 100]    |
-| Memory Usage (%)     | `100 * (1 - (MemFree + Buffers + Cached) / MemTotal)`              | [0, 100]    |
-| Network RX (bytes/s) | `sum(rate(node_network_receive_bytes_total[30s]))`                 | [0, 100000] |
-| Network TX (bytes/s) | `sum(rate(node_network_transmit_bytes_total[30s]))`                | [0, 100000] |
+| Feature              | PromQL Query                                                       | Domain    →  Scaled  |
+|----------------------|--------------------------------------------------------------------|----------------------|
+| CPU Usage (%)        | `100 - avg(irate(node_cpu_seconds_total{mode="idle"}[30s])) * 100` | [0, 100]  → [0, 1]   |
+| Memory Usage (%)     | `100 * (1 - (MemFree + Buffers + Cached) / MemTotal)`              | [0, 100]  → [0, 1]   |
+| Network RX (bytes/s) | `sum(rate(node_network_receive_bytes_total[30s]))`                 | [0, 100K] → [0, 1]   |
+| Network TX (bytes/s) | `sum(rate(node_network_transmit_bytes_total[30s]))`                | [0, 100K] → [0, 1]   |
 
 ### Normalization Strategy
 
